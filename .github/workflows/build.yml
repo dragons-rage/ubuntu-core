@@ -1,0 +1,154 @@
+name: Build and Deploy Container
+run-name: ${{ github.repository }} - ${{ github.actor }} by ${{ github.event_name }} ${{ github.ref }}
+
+env:
+  # TODO: maybe move to ci/cd in repo
+
+  # Used for Docker Containers
+  DOCKER_IMAGE: faliarin/ubuntu-core
+  # Used for GitHub Packages
+  GITHUB_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "main"
+    paths:
+      - "**"
+      - "!README.md"
+      - "!.github/**"
+  pull_request:
+    branches:
+      - "main"
+    paths:
+      - "**"
+      - "!README.md"
+      - "!.github/**"
+jobs:
+  get-next-version:
+    runs-on: arc-runner-set
+    name: Get next version
+    outputs:
+      version: ${{ steps.semver.outputs.next }}
+      strict: ${{ steps.semver.outputs.nextStrict }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Get Release Semantic Version
+        uses: ietf-tools/semver-action@v1
+        id: semver
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: main
+          noVersionBumpBehavior: patch
+
+      - name: Echo Version
+        run: echo "Version would be ${{ steps.semver.outputs.next }}"
+
+  docker-push:
+    name: Push to DockerHub
+    needs: [get-next-version]
+    runs-on: arc-runner-set
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Execute Order 66
+        run: |
+          echo "This is the version to be referenced: ${{ needs.get-next-version.outputs.version }}"
+
+      - name: Build and Push Docker Master Branch
+        uses: docker/build-push-action@v3
+        if: ${{ (github.event_name != 'pull_request') }}
+        with:
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.DOCKER_IMAGE }}:latest,${{ env.DOCKER_IMAGE }}:${{ needs.get-next-version.outputs.strict }}
+          provenance: mode=max
+          sbom: true
+
+  github-push:
+    runs-on: arc-runner-set
+    needs: [get-next-version]
+    name: Push to github packages
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        id: github-registry
+        with:
+          registry: ${{ env.GITHUB_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Execute Order 66
+        run: |
+          echo "This is the version to be referenced: ${{ needs.get-next-version.outputs.version }}"
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          tags: |
+            # Always put version
+            type=semver,pattern={{version}},value=${{ needs.get-next-version.outputs.version }},enable=true
+            # If the push is to the default branch enable
+            #type=raw,value=latest,enable={{is_default_branch}}
+          images: ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and Push Docker Master Branch
+        uses: docker/build-push-action@v3
+        if: ${{ (github.event_name != 'pull_request') }}
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # provenance: mode=max
+          # sbom: true
+
+  tag-new-version:
+    needs: [get-next-version, docker-push, github-push]
+    runs-on: arc-runner-set
+    name: Tag new Version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Tag Release (vX.Y.Z)
+        if: ${{ (github.event_name != 'pull_request') }}
+        run: |
+          git tag ${{ needs.get-next-version.outputs.version }}
+          git push origin ${{ needs.get-next-version.outputs.version }}
